@@ -1,7 +1,5 @@
 import streamlit as st
 import sqlite3
-import pandas as pd
-import plotly.express as px
 from datetime import datetime
 
 # Configure page
@@ -41,11 +39,12 @@ init_db()
 def format_inr(amount):
     return f"₹ {amount:,.2f}"
 
-def get_expenses_df():
+def get_expenses():
     conn = get_db_connection()
-    df = pd.read_sql_query("SELECT id, date, category, amount, description FROM expenses ORDER BY date DESC", conn)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT id, date, category, amount, description FROM expenses ORDER BY date DESC").fetchall()
     conn.close()
-    return df
+    return [dict(row) for row in rows]
 
 def get_budget():
     conn = get_db_connection()
@@ -102,84 +101,77 @@ with st.sidebar:
             st.rerun()
 
 # Load Data
-df = get_expenses_df()
+expenses = get_expenses()
 current_budget = get_budget()
 
 # Calculate Metrics
-total_expense = df['amount'].sum() if not df.empty else 0.0
+total_expense = sum(exp['amount'] for exp in expenses) if expenses else 0.0
 
 current_month_str = datetime.now().strftime("%Y-%m")
-if not df.empty:
-    # Ensure date is string to match the format
-    df['date_str'] = df['date'].astype(str)
-    monthly_df = df[df['date_str'].str.startswith(current_month_str)]
-    monthly_expense = monthly_df['amount'].sum()
-    
-    category_totals = df.groupby('category')['amount'].sum().reset_index()
-    highest_category = category_totals.sort_values(by='amount', ascending=False).iloc[0]['category'] if not category_totals.empty else "-"
-else:
-    monthly_expense = 0.0
-    highest_category = "-"
+monthly_expenses = [exp for exp in expenses if exp['date'].startswith(current_month_str)]
+monthly_expense_total = sum(exp['amount'] for exp in monthly_expenses) if monthly_expenses else 0.0
+
+# Category totals
+category_totals = {}
+for exp in expenses:
+    category_totals[exp['category']] = category_totals.get(exp['category'], 0) + exp['amount']
+
+highest_category = max(category_totals, key=category_totals.get) if category_totals else "-"
 
 # --- Dashboard Metrics ---
 col1, col2, col3, col4 = st.columns(4)
 with col1:
     st.metric("Total Expenses", format_inr(total_expense))
 with col2:
-    st.metric("This Month", format_inr(monthly_expense))
+    st.metric("This Month", format_inr(monthly_expense_total))
 with col3:
-    budget_delta = current_budget - monthly_expense
+    budget_delta = current_budget - monthly_expense_total
     delta_color = "normal" if budget_delta >= 0 else "inverse"
     st.metric("Monthly Budget", format_inr(current_budget), delta=format_inr(budget_delta), delta_color=delta_color)
 with col4:
     st.metric("Highest Category", highest_category)
 
-if monthly_expense > current_budget and current_budget > 0:
+if monthly_expense_total > current_budget and current_budget > 0:
     st.warning("⚠️ Warning: You have exceeded your monthly budget!")
 
 st.divider()
 
 # --- Tabs for Charts and Data ---
-tab1, tab2 = st.tabs(["📊 Analytics", "📋 Transactions & Data Export"])
+tab1, tab2 = st.tabs(["📊 Analytics", "📋 Transactions"])
 
 with tab1:
-    if df.empty:
+    if not expenses:
         st.info("No expenses recorded yet. Add some from the sidebar!")
     else:
         chart_col1, chart_col2 = st.columns(2)
         
         with chart_col1:
             st.subheader("Spending by Category")
-            fig_pie = px.pie(category_totals, values='amount', names='category', hole=0.4, 
-                             color_discrete_sequence=px.colors.qualitative.Pastel)
-            st.plotly_chart(fig_pie, use_container_width=True)
+            # Streamlit native bar chart
+            st.bar_chart(category_totals)
             
         with chart_col2:
             st.subheader("Monthly Trend")
-            # Create a monthly trend
-            df['month'] = df['date_str'].str[:7]
-            trend_df = df.groupby('month')['amount'].sum().reset_index()
-            # Sort chronologically and keep last 6
-            trend_df = trend_df.sort_values('month').tail(6)
+            # Create monthly trend dictionary
+            monthly_trend = {}
+            for exp in expenses:
+                month = exp['date'][:7]
+                monthly_trend[month] = monthly_trend.get(month, 0) + exp['amount']
             
-            fig_bar = px.bar(trend_df, x='month', y='amount', text_auto='.2s', 
-                             labels={'month': 'Month', 'amount': 'Amount (₹)'})
-            fig_bar.update_traces(textfont_size=12, textangle=0, textposition="outside", cliponaxis=False)
-            st.plotly_chart(fig_bar, use_container_width=True)
+            # Sort and take last 6
+            sorted_months = sorted(monthly_trend.keys())[-6:]
+            trend_data = {month: monthly_trend[month] for month in sorted_months}
+            
+            st.line_chart(trend_data)
 
 with tab2:
     st.subheader("Transaction History")
-    if df.empty:
+    if not expenses:
         st.info("No transactions found.")
     else:
-        # Display data using st.dataframe or st.data_editor (for visual representation)
-        # We'll use a simple approach to allow deletion by ID
-        
-        # Format dataframe for display
-        display_df = df[['id', 'date', 'category', 'description', 'amount']].copy()
-        
+        # Display data
         st.dataframe(
-            display_df,
+            expenses,
             column_config={
                 "id": "ID",
                 "date": "Date",
@@ -195,18 +187,9 @@ with tab2:
         st.write("### Manage Transactions")
         del_col1, del_col2 = st.columns([1, 3])
         with del_col1:
-            expense_to_delete = st.selectbox("Select ID to Delete", display_df['id'].tolist())
+            expense_ids = [exp['id'] for exp in expenses]
+            expense_to_delete = st.selectbox("Select ID to Delete", expense_ids)
             if st.button("Delete Expense", type="primary"):
                 delete_expense(expense_to_delete)
                 st.success(f"Expense #{expense_to_delete} deleted!")
                 st.rerun()
-                
-        # Export CSV
-        st.divider()
-        csv = display_df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="⬇️ Download Data as CSV",
-            data=csv,
-            file_name='smart_expenses.csv',
-            mime='text/csv',
-        )
