@@ -1,240 +1,212 @@
-import os
+import streamlit as st
 import sqlite3
-import csv
-# pyrefly: ignore [missing-import]
-from flask import Flask, request, jsonify, render_template, Response
+import pandas as pd
+import plotly.express as px
 from datetime import datetime
 
-app = Flask(__name__)
+# Configure page
+st.set_page_config(page_title="Smart Expense Tracker", page_icon="💸", layout="wide")
+
 DB_FILE = 'database.db'
 
 # --- Database Setup & Utilities ---
 def get_db_connection():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return sqlite3.connect(DB_FILE)
 
 def init_db():
     conn = get_db_connection()
     c = conn.cursor()
-    # Create Expenses Table
     c.execute('''
         CREATE TABLE IF NOT EXISTS expenses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            amount REAL NOT NULL,
+            amount REAL NOT NULL,a
             category TEXT NOT NULL,
             description TEXT,
             date TEXT NOT NULL
         )
     ''')
-    # Create Budget Table (single row for simplicity)
     c.execute('''
         CREATE TABLE IF NOT EXISTS budget (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             amount REAL NOT NULL DEFAULT 0
         )
     ''')
-    
-    # Initialize default budget if not exists
     c.execute('INSERT OR IGNORE INTO budget (id, amount) VALUES (1, 1000.0)')
-    
-    # Check if we need sample data
-    c.execute('SELECT COUNT(*) FROM expenses')
-    if c.fetchone()[0] == 0:
-        sample_expenses = [
-            (150.0, 'Food', 'Groceries', '2023-10-01'),
-            (45.5, 'Travel', 'Uber', '2023-10-02'),
-            (200.0, 'Shopping', 'Shoes', '2023-10-05'),
-            (80.0, 'Bills', 'Electricity', '2023-10-10'),
-            (30.0, 'Entertainment', 'Movie ticket', '2023-10-12'),
-            (50.0, 'Health', 'Pharmacy', '2023-10-15'),
-            (120.0, 'Food', 'Restaurant', '2023-10-20')
-        ]
-        c.executemany('INSERT INTO expenses (amount, category, description, date) VALUES (?, ?, ?, ?)', sample_expenses)
-        
     conn.commit()
     conn.close()
 
-# Initialize DB on startup
 init_db()
 
-# --- Routes ---
+# --- Helper Functions ---
+def format_inr(amount):
+    return f"₹ {amount:,.2f}"
 
-@app.route('/')
-def index():
-    return render_template('index.html')
+def get_expenses_df():
+    conn = get_db_connection()
+    df = pd.read_sql_query("SELECT id, date, category, amount, description FROM expenses ORDER BY date DESC", conn)
+    conn.close()
+    return df
 
-# --- API Routes ---
+def get_budget():
+    conn = get_db_connection()
+    budget = conn.execute('SELECT amount FROM budget WHERE id=1').fetchone()[0]
+    conn.close()
+    return float(budget)
 
-@app.route('/api/expenses', methods=['GET'])
-def get_expenses():
-    try:
-        conn = get_db_connection()
-        # Optional filters
-        category = request.args.get('category')
-        search = request.args.get('search')
-        
-        query = 'SELECT * FROM expenses WHERE 1=1'
-        params = []
-        
-        if category and category != 'All':
-            query += ' AND category = ?'
-            params.append(category)
-        if search:
-            query += ' AND (description LIKE ? OR category LIKE ?)'
-            params.extend(['%'+search+'%', '%'+search+'%'])
+def update_budget(amount):
+    conn = get_db_connection()
+    conn.execute('UPDATE budget SET amount=? WHERE id=1', (amount,))
+    conn.commit()
+    conn.close()
+
+def add_expense(date, category, amount, description):
+    conn = get_db_connection()
+    conn.execute('INSERT INTO expenses (date, category, amount, description) VALUES (?, ?, ?, ?)',
+                 (date.strftime("%Y-%m-%d"), category, float(amount), description))
+    conn.commit()
+    conn.close()
+
+def delete_expense(expense_id):
+    conn = get_db_connection()
+    conn.execute('DELETE FROM expenses WHERE id=?', (int(expense_id),))
+    conn.commit()
+    conn.close()
+
+# --- Main Application ---
+st.title("💸 Smart Expense Tracker")
+
+# Sidebar - Actions
+with st.sidebar:
+    st.header("➕ Add Expense")
+    with st.form("add_expense_form", clear_on_submit=True):
+        date = st.date_input("Date", datetime.today())
+        category = st.selectbox("Category", ["Food", "Travel", "Shopping", "Bills", "Entertainment", "Health", "Education", "Others"])
+        amount = st.number_input("Amount (₹)", min_value=0.01, step=10.0)
+        description = st.text_input("Description (Optional)")
+        submitted = st.form_submit_button("Save Expense")
+        if submitted:
+            add_expense(date, category, amount, description)
+            st.success("Expense added successfully!")
+            st.rerun()
             
-        query += ' ORDER BY date DESC'
+    st.divider()
+    
+    st.header("🎯 Set Budget")
+    current_budget = get_budget()
+    with st.form("update_budget_form"):
+        new_budget = st.number_input("Monthly Budget (₹)", min_value=0.0, value=current_budget, step=100.0)
+        budget_submitted = st.form_submit_button("Update Budget")
+        if budget_submitted:
+            update_budget(new_budget)
+            st.success("Budget updated!")
+            st.rerun()
+
+# Load Data
+df = get_expenses_df()
+current_budget = get_budget()
+
+# Calculate Metrics
+total_expense = df['amount'].sum() if not df.empty else 0.0
+
+current_month_str = datetime.now().strftime("%Y-%m")
+if not df.empty:
+    # Ensure date is string to match the format
+    df['date_str'] = df['date'].astype(str)
+    monthly_df = df[df['date_str'].str.startswith(current_month_str)]
+    monthly_expense = monthly_df['amount'].sum()
+    
+    category_totals = df.groupby('category')['amount'].sum().reset_index()
+    highest_category = category_totals.sort_values(by='amount', ascending=False).iloc[0]['category'] if not category_totals.empty else "-"
+else:
+    monthly_expense = 0.0
+    highest_category = "-"
+
+# --- Dashboard Metrics ---
+col1, col2, col3, col4 = st.columns(4)
+with col1:
+    st.metric("Total Expenses", format_inr(total_expense))
+with col2:
+    st.metric("This Month", format_inr(monthly_expense))
+with col3:
+    budget_delta = current_budget - monthly_expense
+    delta_color = "normal" if budget_delta >= 0 else "inverse"
+    st.metric("Monthly Budget", format_inr(current_budget), delta=format_inr(budget_delta), delta_color=delta_color)
+with col4:
+    st.metric("Highest Category", highest_category)
+
+if monthly_expense > current_budget and current_budget > 0:
+    st.warning("⚠️ Warning: You have exceeded your monthly budget!")
+
+st.divider()
+
+# --- Tabs for Charts and Data ---
+tab1, tab2 = st.tabs(["📊 Analytics", "📋 Transactions & Data Export"])
+
+with tab1:
+    if df.empty:
+        st.info("No expenses recorded yet. Add some from the sidebar!")
+    else:
+        chart_col1, chart_col2 = st.columns(2)
         
-        expenses = conn.execute(query, params).fetchall()
-        conn.close()
-        
-        return jsonify([dict(row) for row in expenses])
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/expenses', methods=['POST'])
-def add_expense():
-    try:
-        data = request.json
-        amount = float(data.get('amount'))
-        category = data.get('category')
-        description = data.get('description', '')
-        date = data.get('date')
-
-        if amount <= 0:
-            return jsonify({'error': 'Amount must be positive'}), 400
-        if not category or not date:
-            return jsonify({'error': 'Category and date are required'}), 400
-
-        conn = get_db_connection()
-        conn.execute('INSERT INTO expenses (amount, category, description, date) VALUES (?, ?, ?, ?)',
-                     (amount, category, description, date))
-        conn.commit()
-        conn.close()
-        return jsonify({'message': 'Expense added successfully'}), 201
-    except ValueError:
-        return jsonify({'error': 'Invalid amount format'}), 400
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/expenses/<int:id>', methods=['PUT'])
-def edit_expense(id):
-    try:
-        data = request.json
-        amount = float(data.get('amount'))
-        category = data.get('category')
-        description = data.get('description', '')
-        date = data.get('date')
-
-        if amount <= 0:
-            return jsonify({'error': 'Amount must be positive'}), 400
-
-        conn = get_db_connection()
-        cursor = conn.execute('UPDATE expenses SET amount=?, category=?, description=?, date=? WHERE id=?',
-                              (amount, category, description, date, id))
-        if cursor.rowcount == 0:
-            conn.close()
-            return jsonify({'error': 'Expense not found'}), 404
-        
-        conn.commit()
-        conn.close()
-        return jsonify({'message': 'Expense updated successfully'})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/expenses/<int:id>', methods=['DELETE'])
-def delete_expense(id):
-    try:
-        conn = get_db_connection()
-        cursor = conn.execute('DELETE FROM expenses WHERE id=?', (id,))
-        if cursor.rowcount == 0:
-            conn.close()
-            return jsonify({'error': 'Expense not found'}), 404
+        with chart_col1:
+            st.subheader("Spending by Category")
+            fig_pie = px.pie(category_totals, values='amount', names='category', hole=0.4, 
+                             color_discrete_sequence=px.colors.qualitative.Pastel)
+            st.plotly_chart(fig_pie, use_container_width=True)
             
-        conn.commit()
-        conn.close()
-        return jsonify({'message': 'Expense deleted successfully'})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        with chart_col2:
+            st.subheader("Monthly Trend")
+            # Create a monthly trend
+            df['month'] = df['date_str'].str[:7]
+            trend_df = df.groupby('month')['amount'].sum().reset_index()
+            # Sort chronologically and keep last 6
+            trend_df = trend_df.sort_values('month').tail(6)
+            
+            fig_bar = px.bar(trend_df, x='month', y='amount', text_auto='.2s', 
+                             labels={'month': 'Month', 'amount': 'Amount (₹)'})
+            fig_bar.update_traces(textfont_size=12, textangle=0, textposition="outside", cliponaxis=False)
+            st.plotly_chart(fig_bar, use_container_width=True)
 
-@app.route('/api/dashboard', methods=['GET'])
-def get_dashboard_stats():
-    try:
-        conn = get_db_connection()
+with tab2:
+    st.subheader("Transaction History")
+    if df.empty:
+        st.info("No transactions found.")
+    else:
+        # Display data using st.dataframe or st.data_editor (for visual representation)
+        # We'll use a simple approach to allow deletion by ID
         
-        # Total Expenses
-        total = conn.execute('SELECT SUM(amount) FROM expenses').fetchone()[0] or 0
+        # Format dataframe for display
+        display_df = df[['id', 'date', 'category', 'description', 'amount']].copy()
         
-        # Current Month Expenses
-        current_month = datetime.now().strftime('%Y-%m')
-        monthly_total = conn.execute("SELECT SUM(amount) FROM expenses WHERE strftime('%Y-%m', date) = ?", (current_month,)).fetchone()[0] or 0
+        st.dataframe(
+            display_df,
+            column_config={
+                "id": "ID",
+                "date": "Date",
+                "category": "Category",
+                "description": "Description",
+                "amount": st.column_config.NumberColumn("Amount (₹)", format="₹ %.2f")
+            },
+            hide_index=True,
+            use_container_width=True
+        )
         
-        # Budget
-        budget = conn.execute('SELECT amount FROM budget WHERE id=1').fetchone()[0] or 0
-        
-        # Category-wise
-        categories = conn.execute('SELECT category, SUM(amount) as total FROM expenses GROUP BY category ORDER BY total DESC').fetchall()
-        category_data = {row['category']: row['total'] for row in categories}
-        
-        # Monthly trend (last 6 months)
-        monthly_trend = conn.execute('''
-            SELECT strftime('%Y-%m', date) as month, SUM(amount) as total 
-            FROM expenses 
-            GROUP BY month 
-            ORDER BY month DESC 
-            LIMIT 6
-        ''').fetchall()
-        
-        trend_data = {row['month']: row['total'] for row in monthly_trend}
-        
-        conn.close()
-        
-        return jsonify({
-            'total_expenses': round(total, 2),
-            'monthly_expenses': round(monthly_total, 2),
-            'budget': round(budget, 2),
-            'categories': category_data,
-            'trend': trend_data
-        })
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/budget', methods=['GET', 'POST'])
-def manage_budget():
-    try:
-        conn = get_db_connection()
-        if request.method == 'GET':
-            budget = conn.execute('SELECT amount FROM budget WHERE id=1').fetchone()[0]
-            conn.close()
-            return jsonify({'budget': budget})
-        elif request.method == 'POST':
-            amount = float(request.json.get('amount', 0))
-            if amount < 0:
-                return jsonify({'error': 'Budget cannot be negative'}), 400
-            conn.execute('UPDATE budget SET amount=? WHERE id=1', (amount,))
-            conn.commit()
-            conn.close()
-            return jsonify({'message': 'Budget updated successfully', 'budget': amount})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/export', methods=['GET'])
-def export_csv():
-    try:
-        conn = get_db_connection()
-        expenses = conn.execute('SELECT date, category, amount, description FROM expenses ORDER BY date DESC').fetchall()
-        conn.close()
-
-        def generate():
-            yield 'Date,Category,Amount,Description\n'
-            for row in expenses:
-                yield f"{row['date']},{row['category']},{row['amount']},\"{row['description']}\"\n"
-
-        return Response(generate(), mimetype='text/csv', headers={"Content-Disposition": "attachment; filename=expenses.csv"})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-if __name__ == '__main__':
-    app.run(debug=False, port=5000)
-
+        st.divider()
+        st.write("### Manage Transactions")
+        del_col1, del_col2 = st.columns([1, 3])
+        with del_col1:
+            expense_to_delete = st.selectbox("Select ID to Delete", display_df['id'].tolist())
+            if st.button("Delete Expense", type="primary"):
+                delete_expense(expense_to_delete)
+                st.success(f"Expense #{expense_to_delete} deleted!")
+                st.rerun()
+                
+        # Export CSV
+        st.divider()
+        csv = display_df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="⬇️ Download Data as CSV",
+            data=csv,
+            file_name='smart_expenses.csv',
+            mime='text/csv',
+        )
